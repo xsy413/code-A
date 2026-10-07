@@ -13,6 +13,7 @@ from tests import (
     make_state,
     make_workspace,
     set_usage,
+    tool_response,
 )
 
 
@@ -25,19 +26,19 @@ def make_nodes(tmp_path: Path, *, stream_fn=None, settings_overrides=None):
     return nodes, llm, store, tools
 
 
-def test_normalize_failure_variants() -> None:
+def test_protocol_error_is_not_classified_from_error_text() -> None:
     tmp_path = make_workspace()
     nodes, _, _, _ = make_nodes(tmp_path)
 
-    assert nodes._normalize_failure("invalid_write_path: x") == "real_failure:invalid_path"
-    assert nodes._normalize_failure("Traceback happened") == "real_failure:runtime"
-    assert nodes._normalize_failure("permission denied") == "real_failure:permission"
-    assert nodes._normalize_failure("no tests collected") == "verification_unavailable:no_tests"
-    assert nodes._normalize_failure("no tests ran") == "verification_unavailable:no_tests"
-    assert nodes._normalize_failure("ERROR at setup") == "real_failure:test_setup"
+    state = make_state(tmp_path)
+    nodes._observe_error(state, "protocol_error", "act failed: multiple tool calls")
+    assert state["status"] == "acting"
+    assert state["required_next_action"] == ""
+    observation = json.loads(state["action_history"][-1]["content"])
+    assert observation["error_kind"] == "protocol_error"
 
 
-def test_recent_turns_text_ignores_active_turn_and_truncates() -> None:
+def test_recent_turns_are_only_in_session_messages_without_character_truncation() -> None:
     tmp_path = make_workspace()
     nodes, _, _, _ = make_nodes(tmp_path, settings_overrides={"max_context_turns": 2})
     long_text = "x" * 200
@@ -54,59 +55,67 @@ def test_recent_turns_text_ignores_active_turn_and_truncates() -> None:
     text = nodes._recent_turns_text(state)
 
     assert "active" not in text
-    assert "request2" in text
-    assert "..." in text
+    assert "request2" not in text
+    history = nodes._build_action_history(state)
+    assert "request2" in json.dumps(history)
+    assert long_text in json.dumps(history)
 
 
-def test_validate_finish_success_and_failure_cases() -> None:
+def test_validate_changed_files_success_and_failure_cases() -> None:
     tmp_path = make_workspace()
     nodes, _, _, _ = make_nodes(tmp_path)
 
     good = tmp_path / "good.py"
     good.write_text("x = 1\n", encoding="utf-8")
 
-    state = make_state(tmp_path)
-    assert nodes._validate_finish(state, ["good.py"], "done") is None
-
-    assert nodes._validate_finish(state, [], "done") == "finish requires args.changed_files."
-    assert nodes._validate_finish(state, ["good.py"], "") == "finish requires args.completion_reason."
-    assert "outside workspace" in nodes._validate_finish(state, ["..\\evil.py"], "done")
-    assert "not found" in nodes._validate_finish(state, ["missing.py"], "done")
+    state = make_state(tmp_path, changed_files=["good.py"])
+    assert nodes._validate_changed_files(state) is None
+    state["changed_files"] = []
+    assert nodes._validate_changed_files(state) == "verification requires recorded changed_files."
+    state["changed_files"] = ["../evil.py"]
+    assert "outside workspace" in nodes._validate_changed_files(state)
+    state["changed_files"] = ["missing.py"]
+    assert "not found" in nodes._validate_changed_files(state)
 
     bad = tmp_path / "bad.py"
     bad.write_text("def x(:\n", encoding="utf-8")
-    err = nodes._validate_finish(state, ["bad.py"], "done")
+    state["changed_files"] = ["bad.py"]
+    err = nodes._validate_changed_files(state)
     assert err is not None and "py_compile check failed" in err
 
 
-def test_validate_finish_skips_deleted_files() -> None:
+def test_validate_changed_files_skips_deleted_files() -> None:
     tmp_path = make_workspace()
     nodes, _, _, _ = make_nodes(tmp_path)
-    state = make_state(tmp_path, deleted_files=["removed.py"])
+    state = make_state(tmp_path, deleted_files=["removed.py"], changed_files=["removed.py"])
 
-    assert nodes._validate_finish(state, ["removed.py"], "done") is None
+    assert nodes._validate_changed_files(state) is None
 
 
-def test_bump_tool_budget_and_track_failure() -> None:
+def test_reserve_budget_and_three_identical_failures() -> None:
     tmp_path = make_workspace()
     nodes, _, _, _ = make_nodes(tmp_path, settings_overrides={"max_tool_calls": 1})
     state = make_state(tmp_path)
 
-    assert nodes._bump_tool_budget(state) is True
-    assert nodes._bump_tool_budget(state) is False
-    assert state["status"] == "failed"
+    assert nodes._reserve_tool_budget(state, 1) is True
+    assert nodes._reserve_tool_budget(state, 1) is False
+    assert state["tool_call_count"] == 1
+    assert "MAX_TOOL_CALLS" in state["stop_reason"]
 
     state2 = make_state(tmp_path)
-    assert nodes._track_failure(state2, "Traceback: boom") is True
-    assert nodes._track_failure(state2, "Traceback: boom") is False
+    for _ in range(2):
+        nodes._observe_error(state2, "execution_error", "Traceback: boom", {"tool": "read_file", "path": "x"})
+        assert state2["status"] == "acting"
+    nodes._observe_error(state2, "execution_error", "Traceback: boom", {"tool": "read_file", "path": "x"})
     assert state2["status"] == "failed"
 
 
-def test_build_action_history_truncates_and_uses_llm_decision() -> None:
+def test_build_action_history_retains_all_complete_native_pairs() -> None:
     tmp_path = make_workspace()
     nodes, _, _, _ = make_nodes(tmp_path)
     tool_calls = []
     for i in range(8):
+        response = tool_response("read_file", {"path": f"file{i}"}, content=f"Reading {i}", call_id=f"call{i}")
         tool_calls.append(
             {
                 "name": f"tool{i}",
@@ -114,7 +123,8 @@ def test_build_action_history_truncates_and_uses_llm_decision() -> None:
                 "ok": i % 2 == 0,
                 "stdout": f"out{i}",
                 "stderr": f"err{i}",
-                "llm_decision": {"tool": f"tool{i}", "args": {"i": i}},
+                "assistant_message": response.to_message(),
+                "tool_call_id": f"call{i}",
             }
         )
     state = make_state(tmp_path, tool_calls=tool_calls)
@@ -122,10 +132,52 @@ def test_build_action_history_truncates_and_uses_llm_decision() -> None:
     history = nodes._build_action_history(state)
 
     assert history is not None
-    assert len(history) == 12
-    first_assistant = history[0]["content"]
-    parsed = json.loads(first_assistant)
-    assert parsed["tool"] == "tool2"
+    history = [m for m in history if m["role"] in {"assistant", "tool"}]
+    assert len(history) == 16
+    assert history[0]["content"] == "Reading 0"
+    for i in range(0, len(history), 2):
+        assert history[i]["role"] == "assistant"
+        assert history[i + 1]["role"] == "tool"
+        assert history[i]["tool_calls"][0]["id"] == history[i + 1]["tool_call_id"]
+    assert json.loads(history[3]["content"])["stderr"] == "err1"
+
+
+def test_build_action_history_converts_legacy_calls_to_observations() -> None:
+    tmp_path = make_workspace()
+    nodes, _, _, _ = make_nodes(tmp_path)
+    state = make_state(tmp_path, tool_calls=[{
+        "name": "read_file", "args": {"path": "old.py"}, "ok": True, "stdout": "old content",
+        "llm_decision": {"tool": "read_file", "args": {"path": "old.py"}},
+    }])
+
+    history = nodes._build_action_history(state)
+
+    assert history is not None
+    assert all(m["role"] == "user" for m in history)
+    assert "old.py" in json.dumps(history)
+    assert "old content" in json.dumps(history)
+    assert "unrecoverable" in json.dumps(history)
+
+
+def test_latest_tool_observation_preserves_long_output_without_prompt_duplication():
+    tmp_path = make_workspace()
+    nodes, _, _, _ = make_nodes(tmp_path)
+    calls = []
+    for index in range(2):
+        response = tool_response("read_file", {"path": f"file{index}"}, call_id=f"call{index}")
+        calls.append({
+            "assistant_message": response.to_message(), "tool_call_id": f"call{index}",
+            "stdout": "x" * 2000, "stderr": "e" * 2000,
+        })
+
+    history = nodes._build_action_history(make_state(tmp_path, tool_calls=calls))
+    history = [m for m in history if m["role"] in {"assistant", "tool"}]
+
+    older = json.loads(history[1]["content"])
+    latest = json.loads(history[3]["content"])
+    assert len(older["stdout"]) == 2000
+    assert len(older["stderr"]) == 2000
+    assert len(latest["stdout"]) == len(latest["stderr"]) == 2000
 
 
 def test_make_payload_and_backup_dir() -> None:

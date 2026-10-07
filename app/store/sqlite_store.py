@@ -23,6 +23,9 @@ class EventRecord:
 class SQLiteStore:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        self.sanitize = lambda value: value
+        self.result_bytes = 20 * 1024 * 1024
+        self.session_bytes = 100 * 1024 * 1024
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -73,6 +76,28 @@ class SQLiteStore:
                     completion_tokens INTEGER NOT NULL DEFAULT 0,
                     total_tokens INTEGER NOT NULL DEFAULT 0
                 );
+                CREATE TABLE IF NOT EXISTS permission_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    ts TEXT NOT NULL,
+                    details_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS context_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL, record_id TEXT NOT NULL,
+                    kind TEXT NOT NULL, payload_json TEXT NOT NULL, ts TEXT NOT NULL,
+                    UNIQUE(session_id, record_id)
+                );
+                CREATE TABLE IF NOT EXISTS tool_output_chunks (
+                    session_id TEXT NOT NULL, result_id TEXT NOT NULL, stream TEXT NOT NULL,
+                    part INTEGER NOT NULL, start_line INTEGER NOT NULL, start_column INTEGER NOT NULL,
+                    body TEXT NOT NULL, byte_count INTEGER NOT NULL,
+                    PRIMARY KEY(session_id, result_id, stream, part)
+                );
+                CREATE TABLE IF NOT EXISTS context_compactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                    ts TEXT NOT NULL, details_json TEXT NOT NULL
+                );
                 """
             )
             conn.commit()
@@ -83,8 +108,9 @@ class SQLiteStore:
 
     def upsert_state(self, session_id: str, state: dict[str, Any]) -> None:
         now = self._now()
-        payload = json.dumps(state, ensure_ascii=False)
+        payload = json.dumps(self.sanitize(state), ensure_ascii=False)
         with closing(self._connect()) as conn:
+            self._save_context_records(conn, session_id, state)
             conn.execute(
                 """
                 INSERT INTO sessions(session_id, state_json, created_at, updated_at)
@@ -127,9 +153,9 @@ class SQLiteStore:
                     node_name,
                     self._now(),
                     duration_ms,
-                    input_summary,
-                    output_summary,
-                    error,
+                    self.sanitize(input_summary),
+                    self.sanitize(output_summary),
+                    self.sanitize(error),
                 ),
             )
             conn.commit()
@@ -146,11 +172,134 @@ class SQLiteStore:
                     self._now(),
                     node_name,
                     tool_name,
-                    json.dumps(args, ensure_ascii=False),
-                    json.dumps(result, ensure_ascii=False),
+                    json.dumps(self.sanitize(args), ensure_ascii=False),
+                    json.dumps(self.sanitize(result), ensure_ascii=False),
                 ),
             )
             conn.commit()
+
+    def save_action_result(self, session_id: str, state: dict, node_name: str, call: dict) -> None:
+        """Commit a completed call and its queue checkpoint together."""
+        now = self._now()
+        with closing(self._connect()) as conn, conn:
+            archive = call.pop("_archive", None)
+            if archive is not None:
+                self._archive_result(conn, session_id, call, archive)
+            conn.execute(
+                "INSERT INTO tool_calls(session_id, ts, node_name, tool_name, args_json, result_json) VALUES (?, ?, ?, ?, ?, ?)",
+                (session_id, now, node_name, call["name"], json.dumps(self.sanitize(call["args"]), ensure_ascii=False),
+                 json.dumps(self.sanitize(call), ensure_ascii=False)),
+            )
+            conn.execute(
+                "INSERT INTO sessions(session_id, state_json, created_at, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET state_json=excluded.state_json, updated_at=excluded.updated_at",
+                (session_id, json.dumps(self.sanitize(state), ensure_ascii=False), now, now),
+            )
+
+    def _save_context_records(self, conn, session_id: str, state: dict) -> None:
+        for group in state.get("session_history", []):
+            if group.get("record_id"):
+                conn.execute("INSERT OR IGNORE INTO context_records(session_id,record_id,kind,payload_json,ts) VALUES (?,?,?,?,?)",
+                             (session_id, group["record_id"], group["type"], json.dumps(self.sanitize(group), ensure_ascii=False), self._now()))
+
+    def _archive_result(self, conn, session_id: str, call: dict, archive: dict) -> None:
+        used = conn.execute("SELECT COALESCE(SUM(byte_count),0) FROM tool_output_chunks WHERE session_id=?", (session_id,)).fetchone()[0]
+        remaining = max(0, min(self.result_bytes, self.session_bytes - used))
+        meta = call.setdefault("output_meta", {})
+        complete = bool(meta.get("archive_complete", True))
+        for stream in ("stdout", "stderr"):
+            text = self.sanitize(archive.get(stream, ""))
+            supplied = meta.get("capture_segments", {}).get(stream)
+            segments = [(s["start_line"], s.get("start_column", 1), self.sanitize(s["body"])) for s in supplied] if supplied else [(1, 1, text)]
+            size = sum(len(body.encode("utf-8")) for _, _, body in segments)
+            allowance = min(remaining, size)
+            remaining -= allowance
+            if allowance < size:
+                complete = False
+                kept = []
+                head_left, tail_left = allowance // 4, allowance - allowance // 4
+                for line, column, body in segments:
+                    raw = body.encode("utf-8")
+                    piece = raw[:head_left].decode("utf-8", errors="ignore")
+                    head_left -= min(head_left, len(raw))
+                    if piece:
+                        kept.append((line, column, piece))
+                for line, column, body in reversed(segments):
+                    raw = body.encode("utf-8")
+                    piece = raw[max(0, len(raw) - tail_left):].decode("utf-8", errors="ignore") if tail_left else ""
+                    tail_left -= min(tail_left, len(raw))
+                    if piece:
+                        preceding = body[:-len(piece)]
+                        lines = preceding.count("\n")
+                        kept.append((line + lines, len(preceding.rsplit("\n", 1)[-1]) + 1 if lines else column + len(preceding), piece))
+                segments = sorted(kept)
+            for part, (line, column, body) in enumerate(segments):
+                if body:
+                    conn.execute("INSERT OR IGNORE INTO tool_output_chunks VALUES (?,?,?,?,?,?,?,?)",
+                                 (session_id, call["result_id"], stream, part, line, column, body, len(body.encode("utf-8"))))
+        meta["archive_complete"] = complete
+        meta.pop("capture_segments", None)
+        payload = {key: call.get(key) for key in ("result_id", "name", "args", "ok", "exit_code", "execution_status", "error_kind", "output_meta", "permission")}
+        conn.execute("INSERT OR IGNORE INTO context_records(session_id,record_id,kind,payload_json,ts) VALUES (?,?,?,?,?)",
+                     (session_id, call["result_id"], "tool_result", json.dumps(self.sanitize(payload), ensure_ascii=False), self._now()))
+
+    def get_result(self, session_id: str, result_id: str) -> dict | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT payload_json FROM context_records WHERE session_id=? AND record_id=? AND kind='tool_result'", (session_id, result_id)).fetchone()
+            if not row:
+                return None
+            result = json.loads(row[0])
+            chunks = conn.execute("SELECT stream,start_line,start_column,body FROM tool_output_chunks WHERE session_id=? AND result_id=? ORDER BY stream,part", (session_id, result_id)).fetchall()
+        result["chunks"] = [dict(chunk) for chunk in chunks]
+        return result
+
+    def get_tool_records(self, session_id: str) -> list[dict]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute("SELECT tool_name,args_json,result_json FROM tool_calls WHERE session_id=? ORDER BY id", (session_id,)).fetchall()
+        records = []
+        for row in rows:
+            record = json.loads(row["result_json"])
+            record.setdefault("name", row["tool_name"])
+            record.setdefault("args", json.loads(row["args_json"]))
+            records.append(record)
+        return records
+
+    def commit_compaction(self, session_id: str, state: dict, details: dict, *, originals=None) -> None:
+        with closing(self._connect()) as conn, conn:
+            if originals is not None:
+                self._save_context_records(conn, session_id, {"session_history": originals})
+            self._save_context_records(conn, session_id, state)
+            conn.execute("INSERT INTO context_compactions(session_id,ts,details_json) VALUES (?,?,?)",
+                         (session_id, self._now(), json.dumps(self.sanitize(details), ensure_ascii=False)))
+            conn.execute("UPDATE sessions SET state_json=?,updated_at=? WHERE session_id=?",
+                         (json.dumps(self.sanitize(state), ensure_ascii=False), self._now(), session_id))
+
+    def record_compaction_failure(self, session_id: str, details: dict) -> None:
+        with closing(self._connect()) as conn, conn:
+            conn.execute("INSERT INTO context_compactions(session_id,ts,details_json) VALUES (?,?,?)",
+                         (session_id, self._now(), json.dumps(self.sanitize(details), ensure_ascii=False)))
+
+    def get_context_details(self, session_id: str) -> dict:
+        with closing(self._connect()) as conn:
+            used = conn.execute("SELECT COALESCE(SUM(byte_count),0) FROM tool_output_chunks WHERE session_id=?", (session_id,)).fetchone()[0]
+            rows = conn.execute("SELECT details_json FROM context_compactions WHERE session_id=? ORDER BY id", (session_id,)).fetchall()
+            results = conn.execute("SELECT payload_json FROM context_records WHERE session_id=? AND kind='tool_result'", (session_id,)).fetchall()
+        return {"archive_bytes": used, "archive_limit": self.session_bytes,
+                "incomplete_results": sum(not json.loads(row[0]).get("output_meta", {}).get("archive_complete", False) for row in results),
+                "compactions": [json.loads(row[0]) for row in rows]}
+
+    def get_calibration(self, key: str) -> float:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT payload_json FROM context_records WHERE session_id='__calibration__' AND record_id=?", (key,)).fetchone()
+        return float(json.loads(row[0])["factor"]) if row else 1.0
+
+    def save_calibration(self, key: str, factor: float) -> None:
+        with closing(self._connect()) as conn, conn:
+            row = conn.execute("SELECT payload_json FROM context_records WHERE session_id='__calibration__' AND record_id=?", (key,)).fetchone()
+            factor = max(factor, float(json.loads(row[0])["factor"]) if row else 1.0)
+            conn.execute("INSERT INTO context_records(session_id,record_id,kind,payload_json,ts) VALUES ('__calibration__',?,'calibration',?,?) "
+                         "ON CONFLICT(session_id,record_id) DO UPDATE SET payload_json=excluded.payload_json,ts=excluded.ts",
+                         (key, json.dumps({"factor": factor}), self._now()))
 
     def get_events(self, session_id: str) -> list[EventRecord]:
         with closing(self._connect()) as conn:
@@ -164,6 +313,17 @@ class SQLiteStore:
                 (session_id,),
             ).fetchall()
         return [EventRecord(**dict(row)) for row in rows]
+
+    def add_permission_event(self, session_id: str, details: dict) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("INSERT INTO permission_events(session_id, ts, details_json) VALUES (?, ?, ?)",
+                         (session_id, self._now(), json.dumps(self.sanitize(details), ensure_ascii=False)))
+            conn.commit()
+
+    def get_permission_events(self, session_id: str) -> list[dict]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute("SELECT ts, details_json FROM permission_events WHERE session_id = ? ORDER BY id", (session_id,)).fetchall()
+        return [{"ts": row["ts"], **json.loads(row["details_json"])} for row in rows]
 
     def last_session_id(self) -> str | None:
         with closing(self._connect()) as conn:

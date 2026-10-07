@@ -1,26 +1,36 @@
 from __future__ import annotations
 
 import re
+import os
 import shutil
 from pathlib import Path
 
 from app.sandbox import SandboxPolicy
 from app.tools.protocol import ToolResult
+from app.context.paging import page_text, version
+
+
+def _workspace_files(policy: SandboxPolicy, cwd: Path, pattern: str):
+    for root, dirs, names in os.walk(cwd, followlinks=False):
+        dirs[:] = [d for d in dirs if policy.readable(Path(root) / d) and not (Path(root) / d).is_symlink()]
+        for name in names:
+            path = Path(root) / name
+            if policy.readable(path) and path.relative_to(cwd).match(pattern):
+                yield path
 
 
 def list_files(policy: SandboxPolicy, cwd: Path, pattern: str = "*") -> ToolResult:
     policy.validate_path(cwd)
     files: list[str] = []
-    for p in cwd.rglob(pattern):
-        if p.is_file():
+    for p in _workspace_files(policy, cwd, pattern):
+        if p.is_file() and policy.readable(p):
             try:
                 p.relative_to(cwd)
             except ValueError:
                 continue
             files.append(str(p.relative_to(cwd)))
-        if len(files) >= 500:
-            break
-    return ToolResult(ok=True, stdout="\n".join(files), artifacts=files)
+    files.sort()
+    return ToolResult(ok=True, stdout="\n".join(files), output_meta={"total_items": len(files)})
 
 
 def read_file(
@@ -30,6 +40,9 @@ def read_file(
     line_start: int | None = None,
     line_end: int | None = None,
     max_chars: int = 20000,
+    max_lines: int = 2000,
+    column_start: int = 1,
+    expected_version: str = "",
 ) -> ToolResult:
     """读取文件内容，支持行号分页（line_start/line_end 均为 1-indexed，含两端）。"""
     target = (cwd / path).resolve()
@@ -37,21 +50,18 @@ def read_file(
     if not target.exists() or not target.is_file():
         return ToolResult(ok=False, stderr=f"File not found: {path}", exit_code=1)
 
-    content = target.read_text(encoding="utf-8", errors="ignore")
-
-    if line_start is not None or line_end is not None:
-        lines = content.splitlines(keepends=True)
-        total_lines = len(lines)
-        start_idx = max(0, (line_start or 1) - 1)
-        end_idx = min(total_lines, line_end or total_lines)
-        sliced = "".join(lines[start_idx:end_idx])
-        header = f"[Lines {start_idx + 1}–{end_idx} of {total_lines} total]\n"
-        content = header + sliced
-
-    if len(content) > max_chars:
-        content = content[:max_chars] + f"\n... [truncated: showing first {max_chars} chars]"
-
-    return ToolResult(ok=True, stdout=content, artifacts=[str(target)])
+    import hashlib
+    raw = target.read_bytes()
+    content = raw.decode("utf-8", errors="ignore").replace("\r\n", "\n")
+    stamp = hashlib.sha256(raw).hexdigest()
+    if expected_version and expected_version != stamp:
+        return ToolResult(False, stderr="File version changed; restart reading the current version.",
+                          error_kind="version_changed", exit_code=1, output_meta={"path": str(target), "version": stamp})
+    body, meta = page_text(content, line_start=line_start or 1, line_end=line_end,
+                           column_start=column_start, chars=max_chars, lines=max_lines)
+    meta.update({"path": str(target), "version": stamp})
+    return ToolResult(ok=True, stdout=body, artifacts=[str(target)], output_meta=meta,
+                      archive_streams={"stdout": content})
 
 
 def _validate_write_path(cwd: Path, path: str) -> str | None:
@@ -86,7 +96,11 @@ def _backup_file(backup_dir: Path, cwd: Path, rel_path: str) -> str:
     if not source.exists() or not source.is_file():
         return ""  # 新文件，无需备份
 
-    dest = (backup_dir / rel_path).with_suffix(source.suffix + ".bak")
+    try:
+        canonical_rel = source.relative_to(cwd.resolve())
+    except ValueError:
+        return ""  # External paths need approval, but are not covered by workspace backups.
+    dest = (backup_dir / canonical_rel).with_suffix(source.suffix + ".bak")
     if dest.exists():
         return ""  # 本 session 已有备份，保留原始版本，不覆盖
 
@@ -271,8 +285,8 @@ def search_text(
             return ToolResult(ok=False, stderr=f"search_text: invalid regex: {exc}", exit_code=1)
 
     hits: list[str] = []
-    for file_path in cwd.rglob(include_glob):
-        if not file_path.is_file():
+    for file_path in sorted(_workspace_files(policy, cwd, include_glob)):
+        if not file_path.is_file() or not policy.readable(file_path):
             continue
         try:
             policy.validate_path(file_path)
@@ -280,14 +294,11 @@ def search_text(
         except Exception:
             continue
 
-        for idx, line in enumerate(text.splitlines(), start=1):
+        source_lines = text.splitlines()
+        for idx, line in enumerate(source_lines, start=1):
             matched = compiled.search(line) if compiled else (pattern in line)
             if matched:
                 rel = file_path.relative_to(cwd)
-                hits.append(f"{rel}:{idx}:{line}")
-            if len(hits) >= 500:
-                break
-        if len(hits) >= 500:
-            break
-
-    return ToolResult(ok=True, stdout="\n".join(hits), artifacts=[])
+                context = [f"{rel}:{n + 1}:{source_lines[n]}" for n in range(max(0, idx - 4), min(len(source_lines), idx + 3))]
+                hits.append("\n".join(context))
+    return ToolResult(ok=True, stdout="\n\n".join(hits), artifacts=[], output_meta={"total_items": len(hits)})

@@ -1,3 +1,3 @@
-from .client import LLMClient, OpenAICompatClient
+from .client import ActionResponse, LLMClient, OpenAICompatClient, ToolCall
 
-__all__ = ["LLMClient", "OpenAICompatClient"]
+__all__ = ["ActionResponse", "LLMClient", "OpenAICompatClient", "ToolCall"]

@@ -12,64 +12,68 @@ from app.config import Settings
 app = typer.Typer(help="LangGraph coding-agent CLI")
 
 
+@app.command()
+def permissions(
+    cwd: Path = typer.Option(Path("."), "--cwd", help="Workspace path."),
+    command: str | None = typer.Option(None, "--command", help="Analyze a command without executing it."),
+    shell: str = typer.Option("powershell", "--shell", help="bash or powershell."),
+) -> None:
+    """Inspect effective permissions or analyze one shell command without execution."""
+    from app.permissions import PermissionEngine
+    engine = PermissionEngine(cwd)
+    if engine.config_error:
+        raise typer.BadParameter(engine.config_error)
+    typer.echo(f"User configuration: {engine.config_path}")
+    typer.echo("No OS filesystem/network isolation. Unmatched commands require approval.")
+    if command is not None:
+        if shell not in {"bash", "powershell"}:
+            raise typer.BadParameter("--shell must be bash or powershell")
+        result = engine.evaluate(shell, {"command": command}, cwd)
+        typer.echo(f"{result.decision}: {result.rule_id}: {result.reason}")
+        return
+    for rule in engine.rules.values():
+        typer.echo(f"{rule.id:8s} {rule.decision:5s} {rule.reason}")
+
+
 def _make_confirm_fn(cwd: Path):
-    """返回一个在终端向用户展示操作详情并请求确认的回调函数。"""
+    from app.permissions import PermissionEngine
+    sanitizer = PermissionEngine(cwd).redact
 
-    def _preview_content(text: str, max_lines: int = 12) -> str:
-        lines = text.splitlines()
-        snippet = "\n".join(lines[:max_lines])
-        if len(lines) > max_lines:
-            snippet += f"\n  … ({len(lines) - max_lines} more lines)"
-        return snippet
-
-    def confirm_fn(tool_name: str, args: dict) -> bool:
-        path = args.get("path", "?")
-        workspace = Path(cwd).resolve()
-        abs_path = (workspace / path).resolve()
-
-        typer.echo("")
-        typer.echo("─" * 60)
-        typer.echo(f"  ⚠️  Agent wants to perform a risky write:")
-        typer.echo(f"     tool : {tool_name}")
-        typer.echo(f"     path : {path}")
-
-        # 显示 diff-style 内容预览
-        if tool_name == "write_file":
-            content = str(args.get("content", ""))
-            if abs_path.exists():
-                typer.echo(f"     mode : OVERWRITE existing file")
-                try:
-                    old = abs_path.read_text(encoding="utf-8", errors="replace")
-                    typer.echo(f"  ── current content (first 8 lines) ──")
-                    typer.echo(_preview_content(old, 8))
-                except Exception:
-                    pass
-                typer.echo(f"  ── new content (first 12 lines) ──")
+    def confirm_fn(tool_name: str, args: dict) -> str:
+        if not sys.stdin.isatty():
+            return "unavailable"
+        permission = args.get("_permission", {})
+        display = sanitizer(args)
+        typer.echo("\nPermission approval")
+        typer.echo(f"  tool: {tool_name}")
+        typer.echo(f"  cwd: {display.get('cwd', display.get('_workspace', str(cwd.resolve())))}")
+        typer.echo(f"  rule: {permission.get('rule_id')}: {sanitizer(permission.get('reason', ''))}")
+        if "command" in display:
+            typer.echo(f"  command: {display['command']}")
+            typer.echo("  Runs as your current user, including child processes; no OS filesystem/network isolation.")
+        else:
+            typer.echo(f"  file: {display.get('path', '?')}")
+            if permission.get("rule_id") != "Q-O13":
+                for key in ("content", "old_str", "new_str"):
+                    if key in display:
+                        typer.echo(f"  {key}: {display[key][:1200]}")
+        for effect in display.get("_permission", {}).get("effects", []):
+            typer.echo(f"  target: {effect}")
+        for program in display.get("_permission", {}).get("executables", []):
+            typer.echo(f"  program: {program}")
+        reusable = permission.get("reusable", False)
+        if reusable:
+            if permission.get("rule_id") == "Q-S09":
+                typer.echo("  Session scope: ordinary file creation/edits throughout this workspace; excludes deletion, sensitive configuration and shell writes.")
             else:
-                typer.echo(f"     mode : CREATE new file")
-                typer.echo(f"  ── content (first 12 lines) ──")
-            typer.echo(_preview_content(content, 12))
-
-        elif tool_name == "patch_file":
-            old_str = str(args.get("old_str", ""))
-            new_str = str(args.get("new_str", ""))
-            typer.echo(f"  ── replacing ──")
-            for line in old_str.splitlines()[:6]:
-                typer.echo(f"  - {line}")
-            typer.echo(f"  ── with ──")
-            for line in new_str.splitlines()[:6]:
-                typer.echo(f"  + {line}")
-
-        elif tool_name == "delete_file":
-            typer.echo(f"     mode : DELETE file permanently")
-
-        typer.echo("─" * 60)
-
+                typer.echo("  Session scope: this exact shell, entry and arguments, including later source/test edits. Entry/config/dependency changes require approval again.")
+            typer.echo("  Session approval expires when this CLI process exits.")
+        choices = "once / session / reject" if reusable else "once / reject"
         try:
-            return typer.confirm("Allow this operation?", default=False)
+            answer = typer.prompt(f"Allow? ({choices})", default="reject").strip().lower()
         except (KeyboardInterrupt, EOFError):
-            typer.echo("\nAborted.")
-            return False
+            return "reject"
+        return {"once": "approve_once", "session": "approve_session" if reusable else "reject"}.get(answer, "reject")
 
     return confirm_fn
 
@@ -86,8 +90,10 @@ def _make_stream_fn():
 
 
 def _build_agent(cwd: Path, yes: bool) -> CodingAgent:
-    settings = Settings.from_env(workspace=cwd.resolve(), auto_confirm_risky_writes=yes)
-    confirm_fn = None if yes else _make_confirm_fn(cwd)
+    if yes:
+        typer.echo("Warning: --yes is deprecated and does not bypass permission approval.", err=True)
+    settings = Settings.from_env(workspace=cwd.resolve(), auto_confirm_risky_writes=False)
+    confirm_fn = _make_confirm_fn(cwd)
     stream_fn = _make_stream_fn()
     return CodingAgent(settings, confirm_fn=confirm_fn, stream_fn=stream_fn)
 
@@ -99,8 +105,41 @@ def _print_result(result: dict) -> None:
         typer.echo(f"error: {result.get('error')}")
     if result.get("verification_note"):
         typer.echo(f"verification_note: {result.get('verification_note')}")
+    _print_verification(result)
+    if result.get("status") == "awaiting_human_confirm":
+        typer.echo("Approval required; nothing pending was executed. Resume from an interactive terminal.")
+    if result.get("status") == "awaiting_context":
+        typer.echo(f"Context paused: {result.get('context_error', '')}")
+        typer.echo("Adjust context configuration if necessary, then resume; this is not task completion.")
+        return
     typer.echo("summary:")
     typer.echo(result.get("summary", ""))
+
+
+def _print_verification(state: dict, *, verbose: bool = False) -> None:
+    check = state.get("static_check", {})
+    if check:
+        pending = check.get("revision") != state.get("change_revision", 0) and check.get("status") != "not_run"
+        typer.echo(f"static_check: {check.get('status', 'not_run')}; snapshot_complete={check.get('snapshot_complete', True)}"
+                   + ("; newer changes pending checks" if pending else ""))
+        if verbose:
+            for error in check.get("errors", []):
+                typer.echo(f"  static error: {error}")
+    results = state.get("test_results", [])
+    if not results:
+        typer.echo("tests: not_run (no recorded test execution this turn)")
+    for result in results if verbose else results[-1:]:
+        scope = result.get("scope", {})
+        typer.echo(f"tests: {result.get('status', 'unknown')}; freshness={result.get('freshness', 'unknown')}; "
+                   f"scope={scope.get('kind', 'unknown')}; targets={scope.get('targets', [])}; selectors={scope.get('selectors', {})}")
+        typer.echo(f"  command: {result.get('command', '')}; cwd: {result.get('cwd', '')}; exit_code={result.get('exit_code')}")
+        if result.get("reason"):
+            typer.echo(f"  reason: {result['reason'][:400]}")
+        if verbose:
+            typer.echo(f"  executables: {result.get('executables', [])}")
+            typer.echo(f"  scope_note: {result.get('scope_note', 'Actual coverage unknown.')}")
+    if state.get("legacy_verification_note"):
+        typer.echo(f"historical_verification (freshness unknown): {state['legacy_verification_note']}")
 
 
 @app.command()
@@ -108,7 +147,7 @@ def run(
     task: str = typer.Argument(..., help="Task for the coding agent."),
     cwd: Path = typer.Option(Path("."), "--cwd", help="Workspace path."),
     session_id: str | None = typer.Option(None, "--session-id", help="Optional session id."),
-    yes: bool = typer.Option(False, "--yes", help="Allow risky writes without manual stop."),
+    yes: bool = typer.Option(False, "--yes", help="Deprecated; does not bypass permissions."),
 ) -> None:
     """Run a new session (or add first turn to an explicit session)."""
     agent = _build_agent(cwd, yes)
@@ -120,7 +159,7 @@ def run(
 def resume(
     session_id: str = typer.Argument(..., help="Session id to resume."),
     cwd: Path = typer.Option(Path("."), "--cwd", help="Workspace path."),
-    yes: bool = typer.Option(False, "--yes", help="Allow risky writes without manual stop."),
+    yes: bool = typer.Option(False, "--yes", help="Deprecated; does not bypass permissions."),
 ) -> None:
     """Resume an existing session from SQLite state."""
     agent = _build_agent(cwd, yes)
@@ -133,7 +172,7 @@ def chat(
     cwd: Path = typer.Option(Path("."), "--cwd", help="Workspace path."),
     session_id: str | None = typer.Option(None, "--session-id", help="Existing session id."),
     new: bool = typer.Option(False, "--new", help="Start a fresh session."),
-    yes: bool = typer.Option(False, "--yes", help="Allow risky writes without manual stop."),
+    yes: bool = typer.Option(False, "--yes", help="Deprecated; does not bypass permissions."),
 ) -> None:
     """Interactive multi-turn chat in the same session context."""
     agent = _build_agent(cwd, yes)
@@ -146,7 +185,7 @@ def chat(
         sid = agent.last_session_id() or agent.start_session(cwd)
 
     typer.echo(f"session_id: {sid}")
-    typer.echo("Commands: /exit, /new, /session, /session <id>")
+    typer.echo("Commands: /exit, /new, /session, /session <id>, /resume, /revoke, /context")
 
     while True:
         try:
@@ -166,6 +205,16 @@ def chat(
             sid = agent.start_session(cwd)
             typer.echo(f"session_id: {sid}")
             continue
+        if user_input == "/revoke":
+            agent.permissions.grants = {g for g in agent.permissions.grants if g[0] != sid}
+            typer.echo("Current session approvals revoked.")
+            continue
+        if user_input == "/resume":
+            _print_result(agent.resume(sid))
+            continue
+        if user_input == "/context":
+            _print_context(agent, sid)
+            continue
 
         if user_input.startswith("/session"):
             parts = user_input.split(maxsplit=1)
@@ -176,8 +225,11 @@ def chat(
                 typer.echo(f"switched session_id: {sid}")
             continue
 
-        result = agent.run_turn(session_id=sid, user_request=user_input, cwd=cwd)
-        _print_result(result)
+        try:
+            result = agent.run_turn(session_id=sid, user_request=user_input, cwd=cwd)
+            _print_result(result)
+        except ValueError as exc:
+            typer.echo(str(exc), err=True)
 
 
 @app.command()
@@ -211,16 +263,17 @@ def logs(
             f"needs_more_action={state.get('needs_more_action', False)}"
         )
         if state.get("verification_mode"):
-            typer.echo(f"verification_mode: {state.get('verification_mode')}")
+            typer.echo(f"legacy_verification_mode (ignored): {state.get('verification_mode')}")
         if state.get("verification_note"):
             typer.echo(f"verification_note: {state.get('verification_note')}")
+        _print_verification(state, verbose=True)
 
         # ── Token 用量统计 ──────────────────────────────────────────────────
         try:
             token_summary = agent.store.get_token_summary(sid)
             if token_summary["llm_calls"] > 0:
                 typer.echo(
-                    f"token_usage (this turn): "
+                    f"token_usage (session): "
                     f"prompt={token_summary['prompt_tokens']:,}  "
                     f"completion={token_summary['completion_tokens']:,}  "
                     f"total={token_summary['total_tokens']:,}  "
@@ -233,6 +286,8 @@ def logs(
                             f"    {entry['node_name']:10s}  total={entry['total_tokens']:>6,}  "
                             f"calls={entry['calls']}  model={entry['model']}"
                         )
+                typer.echo(f"token_usage (this turn, act): {state.get('token_usage', {})}")
+                typer.echo(f"token_usage (session, compact): {state.get('compact_usage', {})}")
         except Exception:
             pass  # 旧库无 token_usage 表时静默跳过
 
@@ -261,6 +316,47 @@ def logs(
                 typer.echo(f"  err: {event.error}")
         elif event.error:
             typer.echo(f"  err: {event.error}")
+    if verbose:
+        for event in agent.store.get_permission_events(sid):
+            decision = event["decision"]
+            typer.echo(f"[permission] {event['tool']}: {decision['decision']} {decision['rule_id']} -> {event['outcome']}")
+
+
+def _print_context(agent: CodingAgent, sid: str) -> None:
+    import json
+    state = agent.store.load_state(sid)
+    if state is None:
+        raise typer.BadParameter("Session not found.")
+    typer.echo(f"session_id: {sid}")
+    stats = state.get("context_stats", {})
+    typer.echo("last_request: " + json.dumps(stats, ensure_ascii=False))
+    try:
+        from app.context.memory import messages, migrate
+        from app.prompts import SYSTEM_PROMPT
+        migrate(state)
+        history = messages(state["session_history"], state.get("context_summary", ""))
+        estimate = agent.nodes.context_manager.count(state, SYSTEM_PROMPT, agent.nodes.action_prompt(state, history), history, agent.tools.schemas)
+        typer.echo("current_request_estimate: " + json.dumps(estimate, ensure_ascii=False))
+    except Exception as exc:
+        typer.echo(f"current_request_estimate: unavailable ({type(exc).__name__})")
+    typer.echo(f"configured_input_limit: {agent.settings.context.input_limit}")
+    typer.echo(f"retained_groups: {len(state.get('session_history', []))}; summary_present: {bool(state.get('context_summary'))}")
+    details = agent.store.get_context_details(sid)
+    details["compactions"] = [{**{key: item.get(key) for key in ("status", "before_tokens", "after_tokens", "target_met", "model", "calls", "downgraded")},
+                               "source_count": len(item.get("source_records", []))} for item in details["compactions"]]
+    typer.echo("archive: " + json.dumps(details, ensure_ascii=False))
+    if state.get("context_error"):
+        typer.echo("context_error: " + state["context_error"])
+
+
+@app.command()
+def context(session_id: str | None = typer.Argument(None), cwd: Path = typer.Option(Path("."), "--cwd")) -> None:
+    """Show stored input estimates, budgets, compactions and archive coverage without a model call."""
+    agent = _build_agent(cwd, False)
+    sid = session_id or agent.last_session_id()
+    if not sid:
+        raise typer.BadParameter("No session found.")
+    _print_context(agent, sid)
 
 
 @app.command()

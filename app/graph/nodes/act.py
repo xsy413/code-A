@@ -1,297 +1,99 @@
 from __future__ import annotations
 
-import json
 import time
-from pathlib import Path
+import json
 
 from app.graph.state import AgentState
 from app.prompts import ACTION_PROMPT, SYSTEM_PROMPT
+from app.context.manager import ContextPaused
+from app.context.memory import append_group, test_facts
 
 
 class _ActNode:
-    def _tool_matches_required_action(self, tool_name: str, required_next_action: str) -> bool:
-        if not required_next_action:
-            return True
-        mapping: dict[str, set[str]] = {
-            "inspect_workspace": {"inspect_workspace", "read_file", "list_files"},
-            "python_probe": {"python_probe", "read_file", "search_text"},
-            "run_test_target": {"run_test_target", "read_file"},
-            "read_test_file": {"read_file", "search_text"},
-            "read_failure_output": {"read_file", "search_text"},
-        }
-        allowed = mapping.get(required_next_action, {required_next_action})
-        return tool_name in allowed
+    def action_prompt(self, state: AgentState, history: list[dict] | None) -> str:
+        context = []
+        test_summaries = test_facts(state.get("test_results", []))
+        for label, value in (
+            ("Workspace observations", state.get("workspace_snapshot")),
+            ("Verification note", state.get("verification_note")),
+            ("Latest static check (not a test result)", json.dumps(state.get("static_check", {}), ensure_ascii=False)),
+            ("Test results (stale results do not validate current files)", json.dumps(test_summaries, ensure_ascii=False)),
+            ("Historical verification note (freshness unknown)", state.get("legacy_verification_note")),
+            ("Test command reference (NOT automatically executed)", self.settings.test_command),
+            ("Last recorded failure (may be historical; compare latest results)", state.get("error")),
+            ("Current file versions and historical reading evidence", json.dumps(state.get("file_read_index", []), ensure_ascii=False)),
+            ("Execution budgets and changes", json.dumps({k: state.get(k) for k in ("active_turn_id", "tool_call_count", "retry_attempts", "changed_files", "change_revision", "execution_errors")}, ensure_ascii=False)),
+            ("Program-maintained session facts (take precedence over summaries)", json.dumps(state.get("session_facts", {}), ensure_ascii=False)),
+        ):
+            if value:
+                context.append(f"{label}: {value}")
+        if not history and state.get("last_tool_output"):
+            context.append(f"Last tool output: {state['last_tool_output']}")
+        request = self._current_request(state)
+        if any(g.get("turn_id") == state.get("active_turn_id") and g.get("message", {}).get("role") == "user"
+               and g["message"].get("content") == request for g in state.get("session_history", [])):
+            request = "(the current turn's full user message in session history; do not revive older tasks)"
+        return self._redact(ACTION_PROMPT.format(
+            current_request=request, workspace=state["workspace"],
+            conversation_summary="(see session history)", recent_turns="(see session history)",
+            runtime_context="\n".join(context)))
 
     def act(self, state: AgentState) -> AgentState:
         started = time.time()
+        if state.get("pending_batch"):
+            state["status"] = "executing"
+            return state
         try:
-            prompt = ACTION_PROMPT.format(
-                current_request=self._current_request(state),
-                plan=state.get("plan", ""),
-                workspace_snapshot=state.get("workspace_snapshot", {}),
-                required_next_action=state.get("required_next_action", ""),
-                plan_constraints=(
-                    f"failure_type={state.get('failure_type', '')}; "
-                    f"hypothesis={state.get('root_cause_hypothesis', '')}"
-                ),
-                conversation_summary=self._conversation_summary(state),
-                recent_turns=self._recent_turns_text(state),
-                last_tool_output=state.get("last_tool_output", ""),
-                reflection=state.get("last_reflection", ""),
-            )
+            history = self._build_action_history(state)
+            prompt = self.action_prompt(state, history)
+            history = self.context_manager.prepare(state, SYSTEM_PROMPT, prompt, self.tools.schemas, prompt_factory=self.action_prompt)
+            prompt = self.action_prompt(state, history)
+            state["context_stats"] = self.context_manager.count(state, SYSTEM_PROMPT, prompt, history, self.tools.schemas)
+            if state["context_stats"]["tokens"] > self.settings.context.input_limit:
+                raise ContextPaused("Rebuilt current facts exceed the input limit; no model request was sent.")
+            if hasattr(self.llm, "max_output_tokens"):
+                self.llm.max_output_tokens = self.settings.context.output_reserve
             if self.stream_fn:
-                tc = state.get("tool_call_count", 0)
-                self.stream_fn(f"\n\u001b[2m[act #{tc + 1}] deciding...\u001b[0m\n")
-            decision = self.llm.complete_json(
-                SYSTEM_PROMPT,
-                prompt,
-                history=self._build_action_history(state),
-            )
-            self._accumulate_usage(state, "act")
-            tool_name = str(decision.get("tool", "finish"))
-            args = decision.get("args", {})
-
-            self.store.add_tool_call(
-                state["session_id"],
-                "act_decision",
-                tool_name,
-                args if isinstance(args, dict) else {},
-                {"ok": None, "phase": "planned"},
-            )
-
-            required_next_action = str(state.get("required_next_action", "") or "")
-            if required_next_action and not self._tool_matches_required_action(tool_name, required_next_action):
-                state["status"] = "reflecting"
-                state["needs_more_action"] = True
-                state["error"] = (
-                    f"diagnostic_gate: required_next_action={required_next_action}, got={tool_name}. "
-                    "Satisfy diagnosis before editing again."
-                )
-                self._record(state, "act", started, "Blocked by diagnostic gate.", error=state["error"])
-                return state
-
-            if tool_name == "write_file":
-                path = str(args.get("path", ""))
-                cwd = Path(state["workspace"])
-                if self.tools.is_risky_write(cwd, path) and not self.settings.auto_confirm_risky_writes:
-                    state["pending_action"] = decision
-                    state["status"] = "awaiting_human_confirm"
-                    self._record(state, "act", started, f"Pending human confirmation for write: {path}")
-                    return state
-
-            if not self._bump_tool_budget(state):
-                self._record(state, "act", started, "Tool budget exceeded.", error=state["error"])
-                return state
-
-            if tool_name == "finish":
-                changed_files = args.get("changed_files") or state.get("changed_files", [])
-                completion_reason = str(args.get("completion_reason", "")).strip()
-                if isinstance(changed_files, str):
-                    changed_files = [changed_files]
-                if not isinstance(changed_files, list):
-                    changed_files = []
-
-                validation_error = self._validate_finish(
-                    state,
-                    [str(p) for p in changed_files],
-                    completion_reason,
-                )
-                if validation_error:
-                    state["status"] = "reflecting"
-                    state["error"] = validation_error
-                    state["needs_more_action"] = True
-                    self._record(state, "act", started, "Finish self-check failed.", error=state["error"])
-                    return state
-
-                payload = self._make_payload(state, tool_name, args)
-                result = self.tools.execute(payload)
-                call = {
-                    "name": tool_name,
-                    "args": args,
-                    "ok": result.ok,
-                    "stdout": result.stdout[:2000],
-                    "stderr": result.stderr[:2000],
-                    "exit_code": result.exit_code,
-                }
-                state["tool_calls"].append(call)
-                self.store.add_tool_call(state["session_id"], "act", tool_name, args, call)
-
-                state["finish_reason"] = completion_reason
-                state["changed_files"] = [str(p) for p in changed_files]
+                self.stream_fn(f"\n[act; tool requests={state.get('tool_call_count', 0)}] deciding...\n")
+            try:
+                response = self.llm.complete_action(SYSTEM_PROMPT, prompt, tools=self.tools.schemas, history=history)
+            finally:
+                self._accumulate_usage(state, "act")
+            if not response.tool_calls:
+                if response.finish_reason != "stop" or not response.content.strip():
+                    raise RuntimeError("Invalid action response: expected complete nonempty final text.")
+                state["summary"] = response.content
+                state["finish_reason"] = "assistant_response"
                 state["needs_more_action"] = False
                 state["status"] = "finished"
-                self._record(state, "act", started, "Executed finish with self-check.")
+                append_group(state, {"type": "message", "message": response.to_message()})
+                self._record(state, "act", started, "Received final assistant answer.")
                 return state
-
-            payload = self._make_payload(state, tool_name, args)
-            result = self.tools.execute(payload)
-            call = {
-                "name": tool_name,
-                "args": args,
-                "ok": result.ok,
-                "stdout": result.stdout[:2000],
-                "stderr": result.stderr[:2000],
-                "exit_code": result.exit_code,
-                "llm_decision": decision,
-            }
-            state["tool_calls"].append(call)
-            state["artifacts"] = list({*state.get("artifacts", []), *result.artifacts})
-            state["last_tool_output"] = (result.stdout or result.stderr)[:2000]
-            self.store.add_tool_call(state["session_id"], "act", tool_name, args, call)
-
-            if not result.ok:
-                state["status"] = "diagnosing"
-                state["needs_more_action"] = True
-                state["error"] = (result.stderr or result.stdout or f"tool failed: {tool_name}")[:2000]
-                self._record(state, "act", started, f"Tool failed: {tool_name}", error=state["error"])
-                return state
-
-            if tool_name == "inspect_workspace":
-                try:
-                    snapshot = json.loads(result.stdout)
-                    if isinstance(snapshot, dict):
-                        state["workspace_snapshot"] = snapshot
-                except Exception:
-                    pass
-
-            if tool_name in {"write_file", "patch_file", "delete_file"}:
-                state["write_count"] = int(state.get("write_count", 0)) + 1
-                path = str(args.get("path", "")).strip()
-                if path:
-                    changed = list(state.get("changed_files", []))
-                    if path not in changed:
-                        changed.append(path)
-                    state["changed_files"] = changed
-
-                if tool_name == "delete_file" and path:
-                    deleted = list(state.get("deleted_files", []))
-                    if path not in deleted:
-                        deleted.append(path)
-                    state["deleted_files"] = deleted
-
-                state["turn_progress"] = "modified"
-                state["explore_streak"] = 0
-                state["required_next_action"] = ""
-                state["needs_more_action"] = False
-                state["status"] = "verifying"
-                self._record(state, "act", started, f"Executed tool: {tool_name}; progress=modified")
-                return state
-
-            if tool_name == "run_command":
-                state["explore_streak"] = 0
-                state["needs_more_action"] = True
-                state["status"] = "acting"
-                self._record(state, "act", started, "Executed run_command; continue acting")
-                return state
-
-            if self._is_exploration_tool(tool_name):
-                current_progress = str(state.get("turn_progress", "none"))
-                if current_progress != "modified":
-                    state["turn_progress"] = "explored"
-
-                streak = int(state.get("explore_streak", 0)) + 1
-                state["explore_streak"] = streak
-                state["needs_more_action"] = True
-
-                if required_next_action and self._tool_matches_required_action(tool_name, required_next_action):
-                    state["required_next_action"] = ""
-
-                if int(state.get("write_count", 0)) == 0 and streak > self.settings.max_explore_steps_before_write:
-                    state["status"] = "reflecting"
-                    state["error"] = (
-                        "no_code_change_yet: too many exploration steps without write_file. "
-                        "Create/modify code or finish with valid evidence."
-                    )
-                    self._record(state, "act", started, "Exploration threshold exceeded.", error=state["error"])
-                    return state
-
-                state["status"] = "acting"
-                self._record(state, "act", started, f"Executed exploration tool: {tool_name}; continue acting")
-                return state
-
-            state["needs_more_action"] = True
-            state["status"] = "acting"
-            self._record(state, "act", started, f"Executed tool: {tool_name}; continue acting")
+            if response.finish_reason != "tool_calls":
+                raise RuntimeError("Invalid action response: incomplete tool calls.")
+            ids = [call.id for call in response.tool_calls]
+            if any(not isinstance(value, str) or not value.strip() for value in ids) or len(set(ids)) != len(ids):
+                raise RuntimeError("Invalid action response: tool IDs must be nonempty and unique.")
+            if any(not isinstance(call.name, str) or not call.name.strip() for call in response.tool_calls):
+                raise RuntimeError("Invalid action response: tool name is required.")
+        except ContextPaused as exc:
+            state["status"] = "awaiting_context"
+            state["context_error"] = self._redact(str(exc))
+            self._record(state, "act", started, "Paused before model request: context unavailable.")
             return state
         except Exception as exc:
-            state["status"] = "diagnosing"
-            state["needs_more_action"] = True
-            state["error"] = f"act failed: {exc}"
-            self._record(state, "act", started, "Action failed.", error=state["error"])
+            if getattr(exc, "capacity_error", False):
+                state["status"] = "awaiting_context"
+                state["context_error"] = "Model service rejected the configured context capacity. Adjust CONTEXT_WINDOW/tokenizer/estimation settings and resume."
+                self._record(state, "act", started, "Paused due to explicit service capacity error.")
+                return state
+            self._observe_error(state, "protocol_error", f"Action response error: {exc}")
+            self._record(state, "act", started, "Response error returned as an observation.", error=state["error"])
             return state
 
-    def human_confirm(self, state: AgentState) -> AgentState:
-        started = time.time()
-        pending = state.get("pending_action") or {}
-        if not pending:
-            state["status"] = "failed"
-            state["error"] = "No pending action for human_confirm."
-            self._record(state, "human_confirm", started, "Missing pending action.", error=state["error"])
-            return state
-
-        tool_name = str(pending.get("tool", ""))
-        args = pending.get("args", {}) or {}
-
-        if self.confirm_fn is not None:
-            try:
-                approved = self.confirm_fn(tool_name, args)
-            except (KeyboardInterrupt, EOFError):
-                approved = False
-        else:
-            approved = self.settings.auto_confirm_risky_writes
-
-        if not approved:
-            state["pending_action"] = {}
-            state["status"] = "reflecting"
-            state["needs_more_action"] = True
-            state["error"] = (
-                f"User declined {tool_name} on {args.get('path', '?')}. "
-                "Find an alternative approach that does not require overwriting existing files, "
-                "or finish with what's already done."
-            )
-            self._record(state, "human_confirm", started, "User declined.", error=state["error"])
-            return state
-
-        if not self._bump_tool_budget(state):
-            self._record(state, "human_confirm", started, "Tool budget exceeded.", error=state["error"])
-            return state
-
-        payload = self._make_payload(state, str(pending.get("tool", "")), pending.get("args", {}))
-        result = self.tools.execute(payload)
-        call = {
-            "name": payload.name,
-            "args": payload.args,
-            "ok": result.ok,
-            "stdout": result.stdout[:2000],
-            "stderr": result.stderr[:2000],
-            "exit_code": result.exit_code,
-        }
-        state["tool_calls"].append(call)
-        state["pending_action"] = {}
-        self.store.add_tool_call(state["session_id"], "human_confirm", payload.name, payload.args, call)
-
-        if payload.name == "write_file" and result.ok:
-            state["write_count"] = int(state.get("write_count", 0)) + 1
-            path = str(payload.args.get("path", "")).strip()
-            if path:
-                changed = list(state.get("changed_files", []))
-                if path not in changed:
-                    changed.append(path)
-                state["changed_files"] = changed
-            state["turn_progress"] = "modified"
-            state["explore_streak"] = 0
-
-        if result.ok:
-            if payload.name == "write_file":
-                state["needs_more_action"] = False
-                state["status"] = "verifying"
-            else:
-                state["needs_more_action"] = True
-                state["status"] = "acting"
-            self._record(state, "human_confirm", started, f"Approved and executed: {payload.name}")
-        else:
-            state["status"] = "diagnosing"
-            state["needs_more_action"] = True
-            state["error"] = (result.stderr or result.stdout or "human_confirm tool failed")[:2000]
-            self._record(state, "human_confirm", started, "Approved action failed.", error=state["error"])
+        calls = [{"tool": call.name, "args": call.args, "tool_call_id": call.id,
+                  "raw_arguments": call.raw_arguments, "argument_error": call.argument_error}
+                 for call in response.tool_calls]
+        self._accept_batch(state, calls, "act", response.to_message())
+        self._record(state, "act", started, f"Accepted {len(calls)} tool requests.")
         return state

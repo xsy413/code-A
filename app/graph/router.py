@@ -5,22 +5,23 @@ from app.graph.state import AgentState
 
 def route_from_status(state: AgentState) -> str:
     status = state.get("status", "failed")
+    if status == "awaiting_context":
+        return "pause"
     if status in {"finished", "failed"}:
         return "finish"
     if status == "intake":
         return "intake"
     if status == "preflighting":
         return "preflight"
-    if status == "planning":
-        return "plan"
-    if status == "acting":
+    # Old persisted sessions may still be waiting at the removed planning stage.
+    if status in {"planning", "acting"}:
         return "act"
+    if status == "executing":
+        return "execute"
     if status == "awaiting_human_confirm":
         return "human_confirm"
     if status == "verifying":
         return "verify"
-    if status == "diagnosing":
-        return "diagnose"
-    if status == "reflecting":
-        return "reflect"
+    if status in {"diagnosing", "reflecting"}:
+        return "act"
     return "finish"

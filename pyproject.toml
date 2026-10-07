@@ -10,10 +10,14 @@ requires-python = ">=3.11"
 dependencies = [
   "langgraph>=0.2.0",
   "typer>=0.12.0",
+  "tree-sitter>=0.25,<0.27",
+  "tree-sitter-bash>=0.25,<0.26",
+  "tiktoken>=0.9,<1",
+  "tokenizers>=0.21,<1",
 ]
 
 [project.scripts]
 agent = "app.cli:app"
 
 [tool.setuptools]
-packages = ["app", "app.graph", "app.graph.nodes", "app.llm", "app.tools", "app.sandbox", "app.store", "app.prompts"]
+packages = ["app", "app.context", "app.graph", "app.graph.nodes", "app.llm", "app.tools", "app.sandbox", "app.store", "app.prompts", "app.permissions"]

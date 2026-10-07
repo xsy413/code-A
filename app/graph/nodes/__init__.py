@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from .act import _ActNode
 from .base import _NodeBase
-from .diagnose import _DiagnoseNode
+from .execute import _ExecuteNode
 from .lifecycle import _LifecycleNode
-from .reflect import _ReflectNode
 from .verify import _VerifyNode
 
 
-class AgentNodes(_LifecycleNode, _ActNode, _VerifyNode, _DiagnoseNode, _ReflectNode, _NodeBase):
+class AgentNodes(_LifecycleNode, _ActNode, _ExecuteNode, _VerifyNode, _NodeBase):
     pass
 
 

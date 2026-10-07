@@ -1,126 +1,116 @@
 from __future__ import annotations
 
-from pathlib import Path
+import json
+
+import pytest
 
 from app.graph.nodes import AgentNodes
-from app.tools import ToolResult
 from tests import FakeLLM, FakeStore, FakeTools, make_settings, make_state, make_workspace
 
 
-def make_nodes(tmp_path: Path, *, tools: FakeTools | None = None, settings_overrides=None):
-    llm = FakeLLM()
-    store = FakeStore()
-    _tools = tools or FakeTools()
-    settings = make_settings(tmp_path, **(settings_overrides or {}))
-    return AgentNodes(llm, store, _tools, settings), _tools
+def make_nodes(workspace, **settings):
+    (workspace / "a.py").write_text("value = 1\n")
+    llm, store, tools = FakeLLM(), FakeStore(), FakeTools()
+    return AgentNodes(llm, store, tools, make_settings(workspace, **settings)), llm, tools
 
 
-def test_verify_without_code_change_goes_to_diagnosing() -> None:
-    tmp_path = make_workspace()
-    nodes, _ = make_nodes(tmp_path)
-    state = make_state(tmp_path, turn_progress="none", write_count=0)
-
-    out = nodes.verify(state)
-
-    assert out["status"] == "diagnosing"
-    assert "no_code_change_yet" in out["error"]
-
-
-def test_verify_auto_no_tests_allowed_finishes() -> None:
-    tmp_path = make_workspace()
-    nodes, _ = make_nodes(tmp_path, settings_overrides={"allow_finish_without_tests": True, "verify_mode": "auto"})
-    state = make_state(tmp_path, turn_progress="modified", write_count=1)
-
-    out = nodes.verify(state)
-
-    assert out["status"] == "finished"
-    assert "No test entry found" in out["verification_note"]
+@pytest.mark.parametrize("mode,allowed", [("auto", True), ("required", False), ("required", True)])
+def test_static_check_never_runs_tests_or_requires_them(mode, allowed):
+    workspace = make_workspace()
+    (workspace / "tests").mkdir()
+    nodes, llm, tools = make_nodes(workspace, verify_mode=mode, allow_finish_without_tests=allowed, max_tool_calls=0)
+    state = make_state(workspace, status="verifying", changed_files=["a.py"], error="Previous execution failed")
+    nodes.verify(state)
+    assert state["status"] == "acting"
+    assert state["static_check"]["status"] == "passed"
+    assert state["error"] == "Previous execution failed"
+    assert not tools.executed
+    assert state["tool_call_count"] == state["retry_attempts"] == 0
+    assert not state["pending_batch"]
+    nodes.act(state)
+    assert '"status": "passed"' in llm.action_calls[-1]["user_prompt"]
+    assert json.loads(llm.action_calls[-1]["history"][-1]["content"].split(": ", 1)[1])["kind"] == "static_check"
 
 
-def test_verify_auto_no_tests_not_allowed_goes_to_diagnosing() -> None:
-    tmp_path = make_workspace()
-    nodes, _ = make_nodes(tmp_path, settings_overrides={"allow_finish_without_tests": False, "verify_mode": "auto"})
-    state = make_state(tmp_path, turn_progress="modified", write_count=1)
-
-    out = nodes.verify(state)
-
-    assert out["status"] == "diagnosing"
-    assert "no_tests_available" in out["error"]
-
-
-def test_verify_run_tests_success() -> None:
-    tmp_path = make_workspace()
-    (tmp_path / "tests").mkdir()
-    tools = FakeTools([ToolResult(ok=True, stdout="passed")])
-    nodes, _ = make_nodes(tmp_path, tools=tools, settings_overrides={"verify_mode": "required"})
-    state = make_state(tmp_path, turn_progress="modified", write_count=1)
-
-    out = nodes.verify(state)
-
-    assert out["status"] == "finished"
-    assert out["verification_note"] == "Tests passed."
-    assert out["tool_calls"][-1]["name"] == "run_tests"
+@pytest.mark.parametrize("status", ["passed", "failed", "incomplete"])
+def test_every_static_outcome_reaches_next_act_and_survives_history_clipping(status):
+    workspace = make_workspace()
+    nodes, llm, tools = make_nodes(workspace)
+    if status == "failed":
+        (workspace / "a.py").write_text("def broken(:\n")
+    state = make_state(workspace, status="verifying", changed_files=["a.py"], snapshot_complete=status != "incomplete")
+    nodes.verify(state)
+    assert state["static_check"]["status"] == status
+    assert state["status"] == "acting"
+    observation = json.loads(state["action_history"][-1]["content"])
+    assert observation["status"] == status
+    for i in range(7):
+        nodes._append_observation(state, {"kind": "later", "index": i})
+    nodes.act(state)
+    assert f'"status": "{status}"' in llm.action_calls[-1]["user_prompt"]
+    assert "Latest static check (not a test result)" in llm.action_calls[-1]["user_prompt"]
+    assert len(state["action_history"]) == 8
+    assert state["retry_attempts"] == (1 if status == "failed" else 0)
+    assert tools.executed == []
 
 
-def test_verify_uses_run_test_target_when_target_exists() -> None:
-    tmp_path = make_workspace()
-    (tmp_path / "tests").mkdir()
-    tools = FakeTools([ToolResult(ok=False, stderr="assert failed", exit_code=1)])
-    nodes, _ = make_nodes(tmp_path, tools=tools, settings_overrides={"verify_mode": "required"})
-    state = make_state(tmp_path, turn_progress="modified", write_count=1, target_test="tests/test_x.py::test_y")
-
-    out = nodes.verify(state)
-
-    assert out["tool_calls"][-1]["name"] == "run_test_target"
-    assert out["status"] == "diagnosing"
-
-
-def test_verify_no_tests_collected_exit_code_5_allowed() -> None:
-    tmp_path = make_workspace()
-    (tmp_path / "tests").mkdir()
-    tools = FakeTools([ToolResult(ok=False, stderr="no tests collected", exit_code=5)])
-    nodes, _ = make_nodes(tmp_path, tools=tools, settings_overrides={"verify_mode": "auto", "allow_finish_without_tests": True})
-    state = make_state(tmp_path, turn_progress="modified", write_count=1)
-
-    out = nodes.verify(state)
-
-    assert out["status"] == "finished"
-    assert "No tests collected" in out["verification_note"]
+def test_failed_static_check_reports_all_files_and_counts_once_for_same_revision():
+    workspace = make_workspace()
+    nodes, _, tools = make_nodes(workspace)
+    (workspace / "a.py").write_text("def bad(:\n")
+    state = make_state(workspace, changed_files=["a.py", "missing.py"])
+    nodes.verify(state)
+    assert state["static_check"]["status"] == "failed"
+    assert len(state["static_check"]["errors"]) == 2
+    assert state["retry_attempts"] == 1
+    nodes.verify(state)
+    assert state["retry_attempts"] == 1
+    assert tools.executed == []
 
 
-def test_verify_run_tests_failure_goes_to_diagnosing() -> None:
-    tmp_path = make_workspace()
-    (tmp_path / "tests").mkdir()
-    tools = FakeTools([ToolResult(ok=False, stderr="assert failed", exit_code=1)])
-    nodes, _ = make_nodes(tmp_path, tools=tools, settings_overrides={"verify_mode": "required"})
-    state = make_state(tmp_path, turn_progress="modified", write_count=1)
-
-    out = nodes.verify(state)
-
-    assert out["status"] == "diagnosing"
-    assert out["error"] == "assert failed"
-
-
-def test_verify_budget_exceeded_marks_failed() -> None:
-    tmp_path = make_workspace()
-    (tmp_path / "tests").mkdir()
-    nodes, _ = make_nodes(tmp_path, settings_overrides={"verify_mode": "required", "max_tool_calls": 0})
-    state = make_state(tmp_path, turn_progress="modified", write_count=1)
-
-    out = nodes.verify(state)
-
-    assert out["status"] == "failed"
-    assert "MAX_TOOL_CALLS=0" in out["error"]
+def test_deleted_file_records_are_checked_without_importing_code():
+    workspace = make_workspace()
+    nodes, _, tools = make_nodes(workspace)
+    (workspace / "test_side_effect.py").write_text("from pathlib import Path\nPath('side_effect.txt').write_text('bad')\n")
+    state = make_state(workspace, changed_files=["test_side_effect.py", "removed.py"], deleted_files=["removed.py"])
+    nodes.verify(state)
+    assert state["static_check"]["status"] == "passed"
+    assert not (workspace / "side_effect.txt").exists()
+    assert "deletion_record" in state["static_check"]["checks"][1]["checks"]
+    assert tools.executed == []
+    (workspace / "removed.py").write_text("still here")
+    nodes.verify(state)
+    assert "deleted file still exists" in state["static_check"]["errors"][0]
 
 
-def test_verify_exception_routes_to_diagnosing() -> None:
-    tmp_path = make_workspace()
-    (tmp_path / "tests").mkdir()
-    tools = FakeTools([RuntimeError("crash")])
-    nodes, _ = make_nodes(tmp_path, tools=tools, settings_overrides={"verify_mode": "required"})
-    state = make_state(tmp_path, turn_progress="modified", write_count=1)
+def test_no_changed_files_returns_static_error_to_model():
+    workspace = make_workspace()
+    nodes, _, _ = make_nodes(workspace)
+    state = make_state(workspace)
+    nodes.verify(state)
+    assert state["status"] == "acting"
+    assert "requires recorded changed_files" in state["static_check"]["errors"][0]
 
-    out = nodes.verify(state)
 
-    assert out["status"] == "diagnosing"
-    assert out["error"].startswith("verify failed:")
+def test_stop_condition_checks_changes_without_model_or_tests():
+    workspace = make_workspace()
+    nodes, llm, tools = make_nodes(workspace)
+    state = make_state(workspace, changed_files=["a.py"], stop_reason="Budget exceeded", error="Original execution failure")
+    nodes.verify(state)
+    assert state["status"] == "failed"
+    assert state["static_check"]["status"] == "passed"
+    assert state["error"] == "Original execution failure"
+    assert llm.action_calls == tools.executed == []
+
+
+def test_static_check_exception_is_observed():
+    workspace = make_workspace()
+    nodes, llm, _ = make_nodes(workspace)
+    def fail(*_):
+        raise OSError("Unable to inspect")
+    nodes._collect_static_check = fail
+    state = make_state(workspace, changed_files=["a.py"])
+    nodes.verify(state)
+    nodes.act(state)
+    assert state["static_check"]["status"] == "failed"
+    assert "Unable to inspect" in llm.action_calls[-1]["user_prompt"]

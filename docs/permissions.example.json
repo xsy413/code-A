@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "local-disable-git-network",
+      "decision": "deny",
+      "tool": "bash",
+      "argv_prefix": ["git", "push"],
+      "reason": "Git push is disabled for this agent"
+    },
+    {
+      "id": "local-ask-config-read",
+      "decision": "ask",
+      "tool": "read_file",
+      "path": "*/pyproject.toml",
+      "reason": "Confirm access to project execution configuration"
+    }
+  ],
+  "overrides": []
+}

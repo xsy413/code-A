@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from app.config import Settings
 from app.graph.state import AgentState, new_state
+from app.llm import ActionResponse, ToolCall
 from app.tools import ToolInput, ToolResult
 
 
@@ -71,6 +72,10 @@ class FakeStore:
             }
         )
 
+    def save_action_result(self, session_id, state, node_name, call):
+        self.add_tool_call(session_id, node_name, call["name"], call["args"], call)
+        self.upsert_state(session_id, state)
+
     def record_token_usage(
         self,
         session_id: str,
@@ -99,17 +104,44 @@ class FakeTools:
         self.executed: list[ToolInput] = []
         self.risky_checks: list[tuple[Path, str]] = []
 
+    @property
+    def schemas(self):
+        from app.tools.schemas import TOOL_SCHEMAS
+        return TOOL_SCHEMAS
+
+    def test_action(self, target=""):
+        return "bash", {"command": f"pytest -q {target}".strip()}
+
+    def permission_for(self, payload):
+        from app.permissions import PermissionDecision
+        return PermissionDecision("ask" if self.risky_write and payload.name == "write_file" else "allow",
+                                  "Q-O13", "Mock decision", fingerprint="mock", is_test=payload.args.get("command", "").startswith("pytest"))
+
+    def record_permission(self, *args):
+        pass
+
+    def describe_test(self, payload, decision=None):
+        from app.permissions.parser import parse_bash
+        from app.tools.testing import describe_test
+        if payload.name not in {"bash", "powershell"}:
+            return {}
+        return describe_test(parse_bash(payload.args.get("command", "")), payload.args.get("command", ""),
+                             payload.cwd, [])
+
     def is_risky_write(self, cwd: Path, path: str) -> bool:
         self.risky_checks.append((cwd, path))
         return self.risky_write
 
-    def execute(self, payload: ToolInput) -> ToolResult:
+    def execute(self, payload: ToolInput, *, approval="", expected_fingerprint="") -> ToolResult:
+        if self.permission_for(payload).decision == "ask" and not approval:
+            return ToolResult(False, execution_status="needs_approval", permission=self.permission_for(payload).to_dict())
         self.executed.append(payload)
         if not self.responses:
-            return ToolResult(ok=True, stdout="ok", stderr="", artifacts=[], exit_code=0)
+            return ToolResult(ok=True, stdout="ok", stderr="", artifacts=[], exit_code=0, is_test=self.permission_for(payload).is_test)
         next_item = self.responses.pop(0)
         if isinstance(next_item, Exception):
             raise next_item
+        next_item.is_test |= self.permission_for(payload).is_test
         return next_item
 
 
@@ -119,15 +151,39 @@ class FakeLLM:
         text_responses: list[str | Exception] | None = None,
         json_responses: list[dict[str, Any] | Exception] | None = None,
         stream_responses: list[list[str] | Exception] | None = None,
+        action_responses: list[ActionResponse | Exception] | None = None,
     ) -> None:
         self.text_responses = list(text_responses or [])
         self.json_responses = list(json_responses or [])
         self.stream_responses = list(stream_responses or [])
+        self.action_responses = list(action_responses or [])
         self.last_usage: Any = None
 
         self.text_calls: list[dict[str, Any]] = []
         self.json_calls: list[dict[str, Any]] = []
         self.stream_calls: list[dict[str, Any]] = []
+        self.action_calls: list[dict[str, Any]] = []
+
+    def complete_action(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        tools: list[dict],
+        temperature: float = 0,
+        history: list[dict] | None = None,
+    ) -> ActionResponse:
+        self.action_calls.append({
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "tools": tools,
+            "temperature": temperature,
+            "history": history,
+        })
+        item = self.action_responses.pop(0) if self.action_responses else ActionResponse("Done.", (), "stop")
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     def complete_text(
         self,
@@ -209,3 +265,21 @@ def set_usage(llm: FakeLLM, *, prompt: int, completion: int, model: str = "test-
         total_tokens=prompt + completion,
         model=model,
     )
+
+
+def tool_response(name: str, args: dict, *, content: str = "", call_id: str | None = None) -> ActionResponse:
+    return ActionResponse(content, (ToolCall(call_id or f"call_{uuid4().hex}", name, args),), "tool_calls")
+
+
+def drain_execution(nodes, state):
+    while state["status"] == "executing":
+        nodes.execute(state)
+    return state
+
+
+def act_and_execute(nodes, state):
+    return drain_execution(nodes, nodes.act(state))
+
+
+def verify_and_execute(nodes, state):
+    return drain_execution(nodes, nodes.verify(state))

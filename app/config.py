@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
+from app.context.config import ContextConfig
+
+
+_DEPRECATED_WARNED: set[str] = set()
 
 
 def _load_dotenv(path: Path) -> None:
@@ -23,23 +28,32 @@ class Settings:
     openai_api_key: str
     openai_model: str
     base_url: str
-    max_retry_steps: int
+    max_retry_steps: int  # Total failed batches, response errors, and new static-check failures per turn.
     max_tool_calls: int
     max_explore_steps_before_write: int
     max_context_turns: int
     context_summary_max_chars: int
-    allow_finish_without_tests: bool
-    verify_mode: str
+    allow_finish_without_tests: bool  # Deprecated, read for compatibility only.
+    verify_mode: str  # Deprecated, read for compatibility only.
     sandbox_mode: str
     db_path: Path
     workspace: Path
     test_command: str
     auto_confirm_risky_writes: bool
     allowed_commands: frozenset[str]
+    permissions_path: Path | None = None
+    context: ContextConfig = field(default_factory=ContextConfig)
 
     @classmethod
     def from_env(cls, workspace: Path, auto_confirm_risky_writes: bool = False) -> "Settings":
         _load_dotenv(workspace / ".env")
+        for key in ("VERIFY_MODE", "ALLOW_FINISH_WITHOUT_TESTS", "MAX_CONTEXT_TURNS", "CONTEXT_SUMMARY_MAX_CHARS"):
+            if key in os.environ and key not in _DEPRECATED_WARNED:
+                message = ("Context retention is now governed by CONTEXT_* token budgets." if key in {"MAX_CONTEXT_TURNS", "CONTEXT_SUMMARY_MAX_CHARS"}
+                           else "Automatic verification performs static checks only; tests are model-selected.")
+                warnings.warn(f"{key} is deprecated and ignored. {message}",
+                              FutureWarning, stacklevel=2)
+                _DEPRECATED_WARNED.add(key)
 
         api_key = os.getenv("OPENAI_API_KEY", "")
         model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -59,7 +73,7 @@ class Settings:
         sandbox_mode = os.getenv("SANDBOX_MODE", "restricted")
         test_command = os.getenv("TEST_COMMAND", "pytest -q")
 
-        # 允许 run_command 工具调用的命令白名单（逗号分隔）
+        # Legacy setting retained for construction compatibility, never used to grant permission.
         _raw_cmds = os.getenv("ALLOWED_COMMANDS", "pytest,python,pip,uv")
         allowed_commands = frozenset(c.strip() for c in _raw_cmds.split(",") if c.strip())
 
@@ -84,4 +98,5 @@ class Settings:
             test_command=test_command,
             auto_confirm_risky_writes=auto_confirm_risky_writes,
             allowed_commands=allowed_commands,
+            context=ContextConfig.from_env(),
         )

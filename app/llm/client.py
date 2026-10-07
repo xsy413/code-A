@@ -7,6 +7,46 @@ from dataclasses import dataclass, field
 from typing import Iterator, Protocol
 
 
+class LLMHTTPError(RuntimeError):
+    def __init__(self, status: int, detail: str):
+        super().__init__(f"LLM HTTP error {status}: {detail}")
+        self.capacity_error = False
+        try:
+            error = json.loads(detail).get("error", {})
+            self.capacity_error = error.get("code") in {"context_length_exceeded", "max_tokens_exceeded"}
+        except (ValueError, AttributeError):
+            pass
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    args: dict | None
+    raw_arguments: str | None = None
+    argument_error: str = ""
+
+    def to_message(self) -> dict:
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.raw_arguments if self.raw_arguments is not None else json.dumps(self.args, ensure_ascii=False)},
+        }
+
+
+@dataclass(frozen=True)
+class ActionResponse:
+    content: str
+    tool_calls: tuple[ToolCall, ...]
+    finish_reason: str
+
+    def to_message(self) -> dict:
+        message = {"role": "assistant", "content": self.content or None}
+        if self.tool_calls:
+            message["tool_calls"] = [call.to_message() for call in self.tool_calls]
+        return message
+
+
 @dataclass(frozen=True)
 class TokenUsage:
     """单次 LLM 调用的 token 用量（frozen 以保证不可变）。"""
@@ -31,6 +71,16 @@ class TokenUsage:
 
 class LLMClient(Protocol):
     last_usage: TokenUsage | None
+
+    def complete_action(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        tools: list[dict],
+        temperature: float = 0,
+        history: list[dict] | None = None,
+    ) -> ActionResponse: ...
 
     def complete_text(
         self,
@@ -69,6 +119,7 @@ class OpenAICompatClient:
     max_json_retries: int = 3
     # 流式请求使用更长的超时（等待首个 token + 全部 token 生成时间）
     stream_timeout_s: int = 300
+    max_output_tokens: int = 25000
     # 最近一次调用（或重试累计）的 token 用量
     last_usage: TokenUsage | None = field(default=None, repr=False)
 
@@ -99,7 +150,7 @@ class OpenAICompatClient:
                 return response
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"LLM HTTP error {exc.code}: {detail}") from exc
+            raise LLMHTTPError(exc.code, detail) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"LLM connection error: {exc}") from exc
 
@@ -117,6 +168,94 @@ class OpenAICompatClient:
         return msgs
 
     # ── 非流式接口 ──────────────────────────────────────────────────────────
+
+    def complete_action(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        tools: list[dict],
+        temperature: float = 0,
+        history: list[dict] | None = None,
+    ) -> ActionResponse:
+        self.last_usage = None
+        data = self._post({
+            "model": self.model,
+            "messages": self._build_messages(system_prompt, user_prompt, history),
+            "temperature": temperature,
+            "tools": tools,
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "max_tokens": self.max_output_tokens,
+        })
+        choices = data.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+            raise RuntimeError("Invalid action response: expected one choice.")
+        choice = choices[0]
+        reason = choice.get("finish_reason")
+        if reason not in {"stop", "tool_calls"}:
+            raise RuntimeError(f"Incomplete or abnormal action response: finish_reason={reason!r}.")
+        message = choice.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            raise RuntimeError("Invalid action response: missing assistant message.")
+        if message.get("refusal"):
+            raise RuntimeError(f"Action response refused: {message['refusal']}")
+        content = message.get("content")
+        if content is not None and not isinstance(content, str):
+            raise RuntimeError("Invalid action response: content must be text.")
+        raw_calls = message.get("tool_calls")
+        if raw_calls is None:
+            raw_calls = []
+        if not isinstance(raw_calls, list):
+            raise RuntimeError("Invalid action response: tool_calls must be a list.")
+        calls: list[ToolCall] = []
+        ids: set[str] = set()
+        for raw in raw_calls:
+            if not isinstance(raw, dict) or raw.get("type") != "function":
+                raise RuntimeError("Invalid action response: expected a function tool call.")
+            function = raw.get("function")
+            if not isinstance(function, dict):
+                raise RuntimeError("Invalid action response: missing function.")
+            call_id, name = raw.get("id"), function.get("name")
+            if not isinstance(call_id, str) or not call_id.strip() or not isinstance(name, str) or not name.strip():
+                raise RuntimeError("Invalid action response: tool ID and name are required.")
+            if call_id in ids:
+                raise RuntimeError("Invalid action response: duplicate tool call ID.")
+            ids.add(call_id)
+            arguments = function.get("arguments")
+            if not isinstance(arguments, str):
+                raise RuntimeError("Invalid action response: arguments must be a string.")
+            argument_error = ""
+            try:
+                args = json.loads(arguments)
+            except ValueError:
+                args = None
+            if not isinstance(args, dict):
+                args = None
+                argument_error = "Invalid tool arguments: expected a JSON object."
+            calls.append(ToolCall(call_id, name, args, arguments, argument_error))
+        if calls and reason != "tool_calls":
+            raise RuntimeError("Invalid action response: tool calls require finish_reason=tool_calls.")
+        if not calls and (reason != "stop" or not (content or "").strip()):
+            raise RuntimeError("Invalid action response: expected nonempty final text.")
+        return ActionResponse(content=content or "", tool_calls=tuple(calls), finish_reason=reason)
+
+    def complete_compact(self, system_prompt: str, user_prompt: str) -> str:
+        self.last_usage = None
+        data = self._post({"model": self.model, "messages": self._build_messages(system_prompt, user_prompt, None),
+                           "max_tokens": self.max_output_tokens})
+        if self.last_usage and self.last_usage.completion_tokens > self.max_output_tokens:
+            raise RuntimeError("Compaction generation exceeded the configured output budget.")
+        choices = data.get("choices", [])
+        if len(choices) != 1 or choices[0].get("finish_reason") != "stop":
+            raise RuntimeError("Compaction response did not finish normally.")
+        message = choices[0].get("message", {})
+        if message.get("role") != "assistant" or message.get("tool_calls") or message.get("refusal"):
+            raise RuntimeError("Invalid compaction response.")
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError("Empty compaction response.")
+        return content
 
     def complete_text(
         self,
